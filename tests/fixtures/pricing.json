@@ -1,0 +1,105 @@
+{
+  "success": true,
+  "pricing_version": "a42d372ccf0b5dd13ecf71203521f9d2",
+  "auto_groups": ["default"],
+  "group_ratio": { "default": 1 },
+  "usable_group": { "default": "默认分组" },
+  "supported_endpoint": {
+    "image-generation": { "path": "/v1/images/generations", "method": "POST" },
+    "openai": { "path": "/v1/chat/completions", "method": "POST" },
+    "openai-video": { "path": "/v1/videos", "method": "POST" }
+  },
+  "vendors": [
+    { "id": 41, "name": "OpenAI", "icon": "OpenAI" },
+    { "id": 21, "name": "Anthropic", "icon": "Claude.Color" },
+    { "id": 15, "name": "Google", "icon": "Gemini.Color" },
+    { "id": 71, "name": "智谱", "icon": "Zhipu.Color" }
+  ],
+  "data": [
+    {
+      "model_name": "gpt-5.2",
+      "vendor_id": 41,
+      "quota_type": 0,
+      "model_ratio": 0.5,
+      "model_price": 0,
+      "owner_by": "",
+      "completion_ratio": 1,
+      "cache_ratio": 1,
+      "create_cache_ratio": 1,
+      "enable_groups": ["default", "supplier-official", "supplier-fast"],
+      "supported_endpoint_types": ["openai"],
+      "long_context_pricing": { "threshold": 272000, "input": 2, "cache_read": 2, "cache_write": 2, "output": 1.5 },
+      "pricing_version": "769d2b12c66a91c92aece711a1d7d5d9c16721621059fc54ae2f0a7c9acdc151"
+    },
+    {
+      "model_name": "claude-sonnet-5",
+      "vendor_id": 21,
+      "quota_type": 0,
+      "model_ratio": 0.5,
+      "model_price": 0,
+      "owner_by": "",
+      "completion_ratio": 5,
+      "cache_ratio": 0.1,
+      "create_cache_ratio": 1.25,
+      "enable_groups": ["default", "supplier-official"],
+      "supported_endpoint_types": ["openai"]
+    },
+    {
+      "model_name": "glm-5.3-flash",
+      "vendor_id": 71,
+      "quota_type": 0,
+      "model_ratio": 0.5,
+      "model_price": 0,
+      "owner_by": "",
+      "completion_ratio": 4,
+      "enable_groups": ["default"],
+      "supported_endpoint_types": ["openai"]
+    },
+    {
+      "model_name": "gemini-3.1-flash-image",
+      "vendor_id": 15,
+      "quota_type": 1,
+      "model_ratio": 0,
+      "model_price": 1,
+      "owner_by": "",
+      "completion_ratio": 0,
+      "enable_groups": ["default"],
+      "supported_endpoint_types": ["image-generation", "openai"]
+    },
+    {
+      "model_name": "veo-3.1",
+      "vendor_id": 15,
+      "quota_type": 1,
+      "model_ratio": 0,
+      "model_price": 0.4,
+      "owner_by": "",
+      "completion_ratio": 0,
+      "enable_groups": ["default"],
+      "supported_endpoint_types": ["openai-video"],
+      "video_spec_prices": { "720p|any|any": 1, "1080p|any|any": 1, "4k|any|any": 1.5 }
+    },
+    {
+      "model_name": "text-embedding-3-large",
+      "quota_type": 0,
+      "model_ratio": 0.5,
+      "model_price": 0,
+      "owner_by": "",
+      "completion_ratio": 1,
+      "enable_groups": ["default"],
+      "supported_endpoint_types": ["openai"]
+    },
+    {
+      "model_name": "pricing-only-model",
+      "vendor_id": 41,
+      "quota_type": 0,
+      "model_ratio": 0.25,
+      "model_price": 0,
+      "owner_by": "",
+      "completion_ratio": 2,
+      "cache_ratio": 0.5,
+      "create_cache_ratio": 1,
+      "enable_groups": ["supplier-only"],
+      "supported_endpoint_types": ["openai"]
+    }
+  ]
+}

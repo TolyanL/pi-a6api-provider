@@ -1,0 +1,49 @@
+{
+  "name": "pi-a6api-provider",
+  "version": "0.1.0",
+  "description": "A6API provider and model catalog browser for Pi",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "provider",
+    "a6api",
+    "models",
+    "model-catalog"
+  ],
+  "license": "MIT",
+  "author": "TolyanL",
+  "homepage": "https://github.com/TolyanL/pi-a6api-provider#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TolyanL/pi-a6api-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TolyanL/pi-a6api-provider/issues"
+  },
+  "files": [
+    "index.ts",
+    "catalog.ts",
+    "config.ts",
+    "estimate.ts",
+    "info.ts",
+    "json.ts",
+    "picker.ts",
+    "pricing.ts",
+    "text-view.ts",
+    "tests/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/a6api.test.mjs"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

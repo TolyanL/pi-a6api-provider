@@ -1,0 +1,15 @@
+{
+  "hidden": ["mystery-model"],
+  "models": {
+    "claude-sonnet-5": {
+      "name": "Claude Sonnet 5 (gateway)",
+      "contextWindow": 200000,
+      "maxTokens": 32000,
+      "compat": { "supportsReasoningEffort": true }
+    },
+    "glm-5.3-flash": {
+      "contextWindow": 64000,
+      "cost": { "input": 0.1, "output": 0.4 }
+    }
+  }
+}
