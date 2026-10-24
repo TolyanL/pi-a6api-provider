@@ -36,7 +36,7 @@ pi install git:github.com/TolyanL/pi-a6api-provider
 Pin a tag or commit:
 
 ```sh
-pi install git:github.com/TolyanL/pi-a6api-provider@v0.1.0
+pi install git:github.com/TolyanL/pi-a6api-provider@v1.0.0
 ```
 
 Try it for a single invocation without touching your settings:
