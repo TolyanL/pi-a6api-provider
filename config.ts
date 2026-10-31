@@ -3,7 +3,7 @@
  *
  * ```json
  * {
- *   "baseUrl": "https://a6api.com/v1",
+ *   "baseUrl": "https://api.a6api.vip/v1",
  *   "hidden": ["some-model"],
  *   "models": {
  *     "gpt-5.2": {
@@ -45,7 +45,7 @@ export interface A6ApiConfig {
 	models: Record<string, ModelOverride>;
 }
 
-export const DEFAULT_BASE_URL = "https://a6api.com/v1";
+export const DEFAULT_BASE_URL = "https://api.a6api.vip/v1";
 
 let warnedAboutConfig = false;
 

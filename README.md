@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Pi extension](https://img.shields.io/badge/pi-extension-blueviolet.svg)](https://pi.dev)
 
-An [A6API](https://a6api.com) provider and model browser for [Pi](https://pi.dev). A6API is an OpenAI-compatible model gateway — a new-api fork that fans out to OpenAI, Anthropic, Google, DeepSeek, Moonshot, Zhipu, Qwen, xAI, and others.
+An [A6API](https://a6api.vip) provider and model browser for [Pi](https://pi.dev). A6API is an OpenAI-compatible model gateway — a new-api fork that fans out to OpenAI, Anthropic, Google, DeepSeek, Moonshot, Zhipu, Qwen, xAI, and others.
 
 The extension does two things:
 
@@ -95,7 +95,7 @@ Optional `~/.pi/agent/a6api.json`, re-read on every refresh:
 
 ```json
 {
-  "baseUrl": "https://a6api.com/v1",
+  "baseUrl": "https://api.a6api.vip/v1",
   "hidden": ["some-model"],
   "models": {
     "gpt-5.2": {
@@ -111,7 +111,7 @@ Optional `~/.pi/agent/a6api.json`, re-read on every refresh:
 
 | Key | Meaning |
 | --- | --- |
-| `baseUrl` | Endpoint override, e.g. a regional gateway (`https://api.a6api.com/v1`) |
+| `baseUrl` | Endpoint override, e.g. a mirror gateway (`https://api.a6api.vip/v1`); the default |
 | `hidden` | Ids that are never registered with Pi |
 | `models.<id>.name` | Display name |
 | `models.<id>.contextWindow` | Context window, overrides the estimate |

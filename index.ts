@@ -2,7 +2,7 @@
  * pi-a6api-provider — A6API provider support and model catalog browser.
  *
  * Provider: registers `a6api` (OpenAI-compatible gateway at
- * https://a6api.com/v1) with a catalog discovered from the gateway, so the
+ * https://api.a6api.vip/v1) with a catalog discovered from the gateway, so the
  * models appear in `/model`, `Ctrl+P` and `/models` like a built-in provider,
  * priced in the footer and in `/session`.
  *

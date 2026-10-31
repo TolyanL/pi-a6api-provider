@@ -279,18 +279,18 @@ check("prettyName qwen", catalog.prettyName("qwen3.8-max"), "Qwen3.8 Max");
 
 // ─── model definition ────────────────────────────────────────────────
 {
-	const model = catalog.toModel(gpt, "https://a6api.com/v1");
+	const model = catalog.toModel(gpt, "https://api.a6api.vip/v1");
 	check("provider/api", [model.provider, model.api], ["a6api", "openai-completions"]);
-	check("base url", model.baseUrl, "https://a6api.com/v1");
+	check("base url", model.baseUrl, "https://api.a6api.vip/v1");
 	check("cost with tiers", [model.cost.input, model.cost.tiers.length], [1, 1]);
 	check("max_tokens field for the gateway", model.compat.maxTokensField, "max_tokens");
 	check("reasoning effort off by default", model.compat.supportsReasoningEffort, false);
 	check("image input for vision models", model.input, ["text", "image"]);
 
-	const textOnly = catalog.toModel(byId.get("pricing-only-model"), "https://a6api.com/v1");
+	const textOnly = catalog.toModel(byId.get("pricing-only-model"), "https://api.a6api.vip/v1");
 	check("text-only input", textOnly.input, ["text"]);
 
-	const claudeModel = catalog.toModel(claude, "https://a6api.com/v1");
+	const claudeModel = catalog.toModel(claude, "https://api.a6api.vip/v1");
 	check("detail labels a config override", info.describeLines(claude).join("\n").includes("(a6api.json)"), true);
 	check("config compat wins", claudeModel.compat.supportsReasoningEffort, true);
 	check("config compat keeps gateway defaults", claudeModel.compat.maxTokensField, "max_tokens");
@@ -349,12 +349,12 @@ check("pricePair embedding", info.pricePair(byId.get("text-embedding-3-large")),
 	contains("unknown price note", unknown, "no pricing entry");
 
 	const summary = info.summaryLines(joined.models, {
-		baseUrl: "https://a6api.com/v1",
+		baseUrl: "https://api.a6api.vip/v1",
 		version: joined.version,
 		groupRatio: joined.groupRatio,
 		fetchedAt: Date.now() - 60000,
 	}).join("\n");
-	contains("summary provider", summary, "A6API · https://a6api.com/v1");
+	contains("summary provider", summary, "A6API · https://api.a6api.vip/v1");
 	contains("summary counts", summary, "chat 4");
 	contains("summary version", summary, "v a42d372ccf0b");
 }
@@ -475,7 +475,7 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 	check("one provider registered", providers.length, 1);
 	const provider = providers[0];
 	check("provider id", provider.id, "a6api");
-	check("provider base url", provider.baseUrl, "https://a6api.com/v1");
+	check("provider base url", provider.baseUrl, "https://api.a6api.vip/v1");
 	check("provider lists chat models only", provider.getModels().length, 4);
 	check("registered model ids", provider.getModels().map((model) => model.id), [
 		"gpt-5.2",
@@ -515,8 +515,8 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		globalThis.fetch = originalFetch;
 	}
 	check("both gateway endpoints are requested", requested.sort(), [
-		"https://a6api.com/api/pricing",
-		"https://a6api.com/v1/models",
+		"https://api.a6api.vip/api/pricing",
+		"https://api.a6api.vip/v1/models",
 	]);
 	check("network refresh publishes chat models", provider.getModels().map((model) => model.id), [
 		"gpt-5.2",
@@ -545,7 +545,7 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		publish,
 		...overrides,
 	});
-	const chatEntry = catalog.toModel(joined.models.find((model) => model.id === "gpt-5.2"), "https://a6api.com/v1");
+	const chatEntry = catalog.toModel(joined.models.find((model) => model.id === "gpt-5.2"), "https://api.a6api.vip/v1");
 	const storedChat = { ...chatEntry, id: "stored-chat" };
 	const storedImage = { ...chatEntry, id: "stored-image", type: "image" };
 	const stored = { models: [storedChat, storedImage], checkedAt: Date.now() };
