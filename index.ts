@@ -73,8 +73,15 @@ const CATALOG_REFRESH_RETRY_MS = 600;
 /** A refresh can outlive its session (print mode exits fast); stale ctx must not throw. */
 let sessionActive = false;
 
-/** Set by the factory so failover can re-register the provider from event handlers. */
+/**
+ * Set by the factory so failover can re-register the provider from event
+ * handlers. It can go stale: pi replaces the extension runtime on /reload or a
+ * session switch and then rejects every call on the old object.
+ */
 let registeredPi: ExtensionAPI | undefined;
+
+/** Bumped per extension instance; async work from an older one must not touch pi. */
+let runtimeGeneration = 0;
 
 /** Unreachable answers since the last successful one, in this process. */
 let unreachableStreak = 0;
@@ -83,6 +90,8 @@ let unreachableStreak = 0;
 let failoverInFlight = false;
 
 export default function a6apiExtension(pi: ExtensionAPI): void {
+	runtimeGeneration += 1;
+	const generation = runtimeGeneration;
 	registeredPi = pi;
 	const debug = (message: string): void => {
 		if (process.env.A6API_DEBUG) console.error(`[a6api] ${message}`);
@@ -96,6 +105,7 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 	debug(`provider registered with ${loaded} models from ${snapshotPath()}`);
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (generation !== runtimeGeneration) return;
 		sessionActive = true;
 		// Another process may have switched the edge or refreshed the snapshot.
 		refreshEndpointState();
@@ -113,6 +123,7 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 	// Every failed attempt passes through here, retries included: three
 	// unreachable answers in a row mean this edge is not usable.
 	pi.on("message_end", (event, ctx) => {
+		if (generation !== runtimeGeneration) return;
 		const message = event.message;
 		if (message.role !== "assistant" || message.provider !== PROVIDER_ID) return;
 		if (message.stopReason !== "error") {
@@ -126,7 +137,7 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 		debug(`unreachable ${unreachableStreak}/${after}: ${message.errorMessage ?? ""}`);
 		if (unreachableStreak < after || failoverInFlight) return;
 		unreachableStreak = 0;
-		void failoverEndpoint(ctx, `failover after ${after} unreachable requests`);
+		void failoverEndpoint(ctx, `failover after ${after} unreachable requests`, generation);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
@@ -134,6 +145,7 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		if (generation !== runtimeGeneration) return;
 		sessionActive = false;
 		renderStatus(ctx, { clear: true });
 	});
@@ -263,6 +275,11 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
  * baseUrl })` shortcut is for config providers and drops a native registration,
  * so the provider is rebuilt with the URL the state file now resolves to; pi
  * then rewrites the live session model as well.
+ *
+ * The state file is the durable decision, so it is written first and the
+ * re-registration stays best-effort: a switch can land after pi replaced the
+ * extension runtime (`/reload`, session switch), and pi rejects every call on
+ * the old object by killing the process.
  */
 function activateEndpoint(
 	url: string,
@@ -270,19 +287,29 @@ function activateEndpoint(
 	reason: string,
 	ctx: ExtensionContext,
 	options: { manual?: boolean } = {},
-): void {
+): boolean {
 	if (url === primary) clearEndpointState();
 	else writeEndpointState({ baseUrl: url, primary, since: Date.now(), reason, manual: options.manual === true });
-	registeredPi?.registerProvider(buildProvider());
+	const pi = registeredPi;
+	if (!pi) return false;
+	try {
+		pi.registerProvider(buildProvider());
+	} catch (error) {
+		console.warn(
+			`[a6api] endpoint switch recorded, it will be applied on the next start: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return false;
+	}
 	renderStatus(ctx);
+	return true;
 }
 
 /**
  * Rotate to the next edge that answers. Every switch is attempted by an actual
  * catalog refresh, so a host that resolves but serves nothing cannot win.
  */
-async function failoverEndpoint(ctx: ExtensionContext, reason: string): Promise<void> {
-	if (!registeredPi || failoverInFlight) return;
+async function failoverEndpoint(ctx: ExtensionContext, reason: string, generation: number): Promise<void> {
+	if (!registeredPi || failoverInFlight || generation !== runtimeGeneration) return;
 	const config = loadConfig();
 	const primary = primaryBaseUrl(config);
 	const current = resolveBaseUrl(config);
@@ -294,8 +321,9 @@ async function failoverEndpoint(ctx: ExtensionContext, reason: string): Promise<
 	failoverInFlight = true;
 	try {
 		for (const candidate of rotation) {
+			if (generation !== runtimeGeneration) return;
 			if (process.env.A6API_DEBUG) console.error(`[a6api] failover: trying ${candidate.url}`);
-			activateEndpoint(candidate.url, primary, reason, ctx);
+			const applied = activateEndpoint(candidate.url, primary, reason, ctx);
 			if (await refreshCatalog(ctx, { attempts: 1 })) {
 				const route = candidate.route ? ` (${candidate.route})` : "";
 				notify(
@@ -303,6 +331,9 @@ async function failoverEndpoint(ctx: ExtensionContext, reason: string): Promise<
 					`A6API: ${endpointHost(current)} is unreachable, switched to ${endpointHost(candidate.url)}${route}`,
 					"warning",
 				);
+				if (!applied) {
+					notify(ctx, "A6API: restart pi to use the new edge (the runtime was replaced while switching)", "warning");
+				}
 				return;
 			}
 		}

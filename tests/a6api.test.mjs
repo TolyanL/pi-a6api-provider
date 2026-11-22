@@ -592,7 +592,7 @@ async function buildExt() {
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	};
 	await extension(pi);
-	return { handlers, commands, providers };
+	return { pi, handlers, commands, providers };
 }
 
 /** Fixture-backed stand-in for the gateway, remembering every URL it saw. */
@@ -1077,6 +1077,57 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		check("a manual pin survives the start", endpoints.readEndpointState()?.baseUrl, "https://cf.a6api.net/v1");
 		check("the pinned edge stays registered", manual.providers.at(-1).baseUrl, "https://cf.a6api.net/v1");
+	} finally {
+		globalThis.fetch = originalFetch;
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
+	}
+}
+
+// A runtime replaced mid-switch must not take pi down: pi rejects every call on
+// the old extension object with "ctx is stale after session replacement".
+{
+	endpoints.clearEndpointState();
+	endpoints.refreshEndpointState();
+	catalog.writeSnapshotPayload(payloads);
+	catalog.loadCatalogFromDisk({ config: userConfig, resolveLimits: stubLimits });
+	const { pi, handlers, providers } = await buildExt();
+	const ctx = makeCtx();
+	ctx.modelRegistry.refresh = async () => {
+		await providers.at(-1).refreshModels({
+			credential: { type: "api_key", key: "test-key" },
+			stored: undefined,
+			allowNetwork: true,
+			force: true,
+			signal: new AbortController().signal,
+			publish: async (publication) => {
+				publication.update?.();
+				return true;
+			},
+		});
+		return { errors: new Map(), aborted: false };
+	};
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = serveGateway([]);
+	try {
+		await handlers.get("session_start")[0]({ type: "session_start" }, ctx);
+		// Only now does the runtime start rejecting the captured extension object.
+		pi.registerProvider = () => {
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		};
+		const fail = () =>
+			handlers.get("message_end")[0](
+				{ message: { role: "assistant", provider: "a6api", stopReason: "error", errorMessage: "fetch failed" } },
+				ctx,
+			);
+		await fail();
+		await fail();
+		await fail();
+		ok("a stale runtime does not abort the switch", await waitFor(() => endpoints.readEndpointState()?.baseUrl === "https://cf.a6api.net/v1"));
+		ok(
+			"the pending switch is reported",
+			await waitFor(() => ctx.notices.map((notice) => notice[1]).join("\n").includes("restart pi to use the new edge")),
+		);
 	} finally {
 		globalThis.fetch = originalFetch;
 		endpoints.clearEndpointState();
