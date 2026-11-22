@@ -452,8 +452,17 @@ check("pricePair embedding", info.pricePair(byId.get("text-embedding-3-large")),
 	check("api_info is parsed", discovered.map((entry) => entry.url), [
 		"https://api.a6api.vip/v1",
 		"https://cf.a6api.net/v1",
-		"https://media.a6api.net/v1",
 	]);
+	check(
+		"the image/video edge never carries chat traffic",
+		discovered.some((entry) => entry.url.includes("media.a6api.net")),
+		false,
+	);
+	check(
+		"a media route is skipped even on a neutral host",
+		endpoints.parseGatewayEndpoints({ api_info: [{ url: "https://edge.example", route: "视频", description: "直链" }] }),
+		[],
+	);
 	check("edge routes are kept", discovered[1].route, "CF 线路");
 	check(
 		"a bare body works too",
@@ -467,18 +476,16 @@ check("pricePair embedding", info.pricePair(byId.get("text-embedding-3-large")),
 	check("primary first, no duplicates", candidates.map((entry) => entry.url), [
 		"https://api.a6api.vip/v1",
 		"https://cf.a6api.net/v1",
-		"https://media.a6api.net/v1",
 	]);
 	check(
-		"known edges stand in when api_info is empty",
+		"the built-in edge stands in when api_info is empty",
 		endpoints.endpointCandidates("https://api.a6api.vip/v1", []).map((entry) => entry.url),
-		["https://api.a6api.vip/v1", "https://cf.a6api.net/v1", "https://media.a6api.net/v1"],
+		["https://api.a6api.vip/v1", "https://cf.a6api.net/v1"],
 	);
 	check("rotation starts after the active edge", endpoints.rotationFrom(candidates, "https://cf.a6api.net/v1").map((entry) => entry.url), [
-		"https://media.a6api.net/v1",
 		"https://api.a6api.vip/v1",
 	]);
-	check("rotation skips an unknown active edge", endpoints.rotationFrom(candidates, "https://elsewhere.example/v1").length, 3);
+	check("rotation skips an unknown active edge", endpoints.rotationFrom(candidates, "https://elsewhere.example/v1").length, 2);
 	check("host helper", endpoints.endpointHost("https://cf.a6api.net/v1"), "cf.a6api.net");
 
 	// Unreachable means transport or a dead edge, never the account.
@@ -954,7 +961,21 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		for (let attempt = 0; attempt < 4; attempt += 1) await fail("429 rate limit exceeded");
 		check("account and throttle errors do not rotate", providers.length, 2);
 
-		// A candidate that resolves but serves nothing is skipped.
+		// A candidate that resolves but serves nothing is skipped: the gateway
+		// publishes a third edge, and only that one is healthy.
+		catalog.writeSnapshotPayload({
+			...payloads,
+			status: {
+				data: {
+					api_info: [
+						{ url: "https://api.a6api.vip", route: "CDN全球节点", description: "路线自动选择" },
+						{ url: "https://cf.a6api.net", route: "CF 线路", description: "CF 优选线路" },
+						{ url: "https://edge.example", route: "备用线路", description: "直连" },
+					],
+				},
+			},
+		});
+		catalog.loadCatalogFromDisk({ config: userConfig, resolveLimits: stubLimits });
 		endpoints.clearEndpointState();
 		endpoints.refreshEndpointState();
 		await succeed();
@@ -965,8 +986,13 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		await fail();
 		await fail();
 		await fail();
-		ok("a dead candidate is skipped", await waitFor(() => providers.at(-1)?.baseUrl === "https://media.a6api.net/v1"));
-		ok("the skipped edge is announced as media", await waitFor(() => noticeText().includes("switched to media.a6api.net")));
+		ok("a dead candidate is skipped", await waitFor(() => providers.at(-1)?.baseUrl === "https://edge.example/v1"));
+		ok("the healthy edge is announced", await waitFor(() => noticeText().includes("switched to edge.example")));
+
+		// The image/video edge is not a chat fallback, even when it is listed.
+		check("the media edge is not a candidate", endpoints.readEndpointState()?.baseUrl !== "https://media.a6api.net/v1", true);
+		catalog.writeSnapshotPayload(payloads);
+		catalog.loadCatalogFromDisk({ config: userConfig, resolveLimits: stubLimits });
 
 		// No edge left: report it and stay where we were.
 		endpoints.clearEndpointState();

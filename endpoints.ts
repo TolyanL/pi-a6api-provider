@@ -28,11 +28,17 @@ export const FAILOVER_AFTER = 3;
 export const PROBE_TIMEOUT_MS = 5_000;
 
 /**
- * Edges reported by `api_info` when this file was written. They are only used
- * when the gateway never got to publish its own list, e.g. a fresh install on a
- * dead primary.
+ * Edge reported by `api_info` when this file was written. It is only used when
+ * the gateway never got to publish its own list, e.g. a fresh install on a dead
+ * primary.
  */
-export const KNOWN_ENDPOINTS = ["https://cf.a6api.net/v1", "https://media.a6api.net/v1"];
+export const KNOWN_ENDPOINTS = ["https://cf.a6api.net/v1"];
+
+/**
+ * Image and video edges. They front the same gateway but exist for direct media
+ * links, so a chat request must never be routed there.
+ */
+const MEDIA_EDGE = /图片|视频|media|(?:^|[^a-z])image(?:[^a-z]|$)|(?:^|[^a-z])video(?:[^a-z]|$)/i;
 
 export interface GatewayEndpoint {
 	url: string;
@@ -79,8 +85,11 @@ export function parseGatewayEndpoints(status: unknown): GatewayEndpoint[] {
 		const entry = asRecord(raw);
 		const url = withV1(asString(entry?.url));
 		if (!url || seen.has(url)) continue;
+		const route = asString(entry?.route);
+		const note = asString(entry?.description);
+		if (MEDIA_EDGE.test([route, note, url].filter(Boolean).join(" "))) continue;
 		seen.add(url);
-		endpoints.push({ url, route: asString(entry?.route), note: asString(entry?.description) });
+		endpoints.push({ url, route, note });
 	}
 	return endpoints;
 }

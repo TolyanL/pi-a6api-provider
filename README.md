@@ -141,7 +141,7 @@ A6API serves one gateway from several edges. They are not in the documentation �
 ]}}
 ```
 
-The catalog refresh fetches that list together with the models and pricing and stores it in the snapshot, so the edges are known even offline. Two endpoints (`cf.a6api.net`, `media.a6api.net`) are built in as a fallback for a fresh install whose primary is already dead. Every URL is normalized to a base ending in `/v1`.
+The catalog refresh fetches that list together with the models and pricing and stores it in the snapshot, so the edges are known even offline. `media.a6api.net` is skipped: it is the image/video edge, meant for direct media links, so chat requests never go there. `cf.a6api.net` is built in as a fallback for a fresh install whose primary is already dead. Every URL is normalized to a base ending in `/v1`.
 
 Failover keeps a counter of **unreachable** answers — transport failures, dropped streams, 5xx — as reported by Pi's own `isRetryableAssistantError` plus a filter that removes answers proving the edge is alive: `401`/`403`, `429`, quota, billing and context-overflow errors never rotate the endpoint. When the counter reaches `failoverAfter` (3 by default), the provider walks the edge list:
 
