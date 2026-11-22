@@ -595,6 +595,20 @@ async function buildExt() {
 	return { handlers, commands, providers };
 }
 
+/** Fixture-backed stand-in for the gateway, remembering every URL it saw. */
+function serveGateway(requested) {
+	return async (url) => {
+		const target = String(url);
+		requested?.push(target);
+		const body = target.endsWith("/models")
+			? payloads.models
+			: target.endsWith("/api/pricing")
+				? payloads.pricing
+				: payloads.status;
+		return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+	};
+}
+
 /** The failover runs detached from `message_end`; give it a moment to settle. */
 async function waitFor(predicate, timeoutMs = 2000) {
 	const started = Date.now();
@@ -914,19 +928,10 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 
 	const originalFetch = globalThis.fetch;
 	const requested = [];
-	const serveGateway = async (url) => {
-		const target = String(url);
-		requested.push(target);
-		const body = target.endsWith("/models")
-			? payloads.models
-			: target.endsWith("/api/pricing")
-				? payloads.pricing
-				: payloads.status;
-		return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
-	};
+	const gatewayFetch = serveGateway(requested);
 
 	try {
-		globalThis.fetch = serveGateway;
+		globalThis.fetch = gatewayFetch;
 		// Failover only runs inside a live session, like the real thing.
 		await handlers.get("session_start")[0]({ type: "session_start" }, ctx);
 		await waitFor(() => providers.length >= 1);
@@ -981,7 +986,7 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		await succeed();
 		globalThis.fetch = async (url) => {
 			if (String(url).startsWith("https://cf.a6api.net")) throw new Error("fetch failed");
-			return serveGateway(url);
+			return gatewayFetch(url);
 		};
 		await fail();
 		await fail();
@@ -1012,7 +1017,7 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 	}
 
 	// The command surface: list the edges, pin one, reset to the primary.
-	globalThis.fetch = serveGateway;
+	globalThis.fetch = gatewayFetch;
 	try {
 		await commands.get("a6api").handler("endpoint", ctx);
 		const listed = noticeText();
@@ -1030,6 +1035,52 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 		check("reset returns the effective url", config.resolveBaseUrl(config.loadConfig()), "https://api.a6api.vip/v1");
 	} finally {
 		globalThis.fetch = originalFetch;
+	}
+}
+
+// ─── remembered edge at startup ──────────────────────────────────────
+{
+	catalog.writeSnapshotPayload(payloads);
+	catalog.loadCatalogFromDisk({ config: userConfig, resolveLimits: stubLimits });
+	const originalFetch = globalThis.fetch;
+	const requested = [];
+	globalThis.fetch = serveGateway(requested);
+	try {
+		// A failover is provisional: a live primary wins at the next start.
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
+		endpoints.writeEndpointState({
+			baseUrl: "https://cf.a6api.net/v1",
+			primary: "https://api.a6api.vip/v1",
+			since: Date.now(),
+			reason: "failover after 3 unreachable requests",
+		});
+		const auto = await buildExt();
+		check("the remembered edge registers first", auto.providers.at(-1).baseUrl, "https://cf.a6api.net/v1");
+		await auto.handlers.get("session_start")[0]({ type: "session_start" }, makeCtx());
+		ok("a live primary retires the failover", await waitFor(() => endpoints.readEndpointState() === undefined));
+		check("the primary is registered again", auto.providers.at(-1).baseUrl, "https://api.a6api.vip/v1");
+
+		// A pin is the user's choice, so the startup probe must leave it alone.
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
+		endpoints.writeEndpointState({
+			baseUrl: "https://cf.a6api.net/v1",
+			primary: "https://api.a6api.vip/v1",
+			since: Date.now(),
+			reason: "manual switch",
+			manual: true,
+		});
+		const manual = await buildExt();
+		const manualCtx = makeCtx();
+		await manual.handlers.get("session_start")[0]({ type: "session_start" }, manualCtx);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		check("a manual pin survives the start", endpoints.readEndpointState()?.baseUrl, "https://cf.a6api.net/v1");
+		check("the pinned edge stays registered", manual.providers.at(-1).baseUrl, "https://cf.a6api.net/v1");
+	} finally {
+		globalThis.fetch = originalFetch;
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
 	}
 }
 

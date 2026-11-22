@@ -149,7 +149,7 @@ Failover keeps a counter of **unreachable** answers — transport failures, drop
 2. A real catalog refresh from that host decides whether the switch worked. A host that resolves but serves nothing is skipped.
 3. If no edge answers, the provider returns to the one it started from and reports it.
 
-The choice is stored in `~/.pi/agent/a6api-endpoint.json` (`{ baseUrl, primary, since, reason }`), which is separate from `a6api.json` so a machine switch never rewrites your config. A remembered switch wins over `baseUrl` until either `/a6api endpoint reset` clears it, or `baseUrl` in the config changes, which retires the stale state. At startup the primary is probed once (a plain `GET /api/status`, 5 s timeout): if it answers, the provider returns to it; otherwise it keeps the working edge. While a switch is active the footer status carries the host, e.g. `A6 $1.00/$5.00 200k · cf.a6api.net`.
+The choice is stored in `~/.pi/agent/a6api-endpoint.json` (`{ baseUrl, primary, since, reason }`), which is separate from `a6api.json` so a machine switch never rewrites your config. A remembered switch wins over `baseUrl` until either `/a6api endpoint reset` clears it, or `baseUrl` in the config changes, which retires the stale state. At startup the primary is probed once (a plain `GET /api/status`, 5 s timeout): if it answers, the provider returns to it, otherwise it keeps the working edge. An edge pinned by hand (`/a6api endpoint <n|url>`) is exempt — it is the user's choice, so the probe leaves it alone and only a reset moves it. While a switch is active the footer status carries the host, e.g. `A6 $1.00/$5.00 200k · cf.a6api.net`.
 
 ## Where the numbers come from
 

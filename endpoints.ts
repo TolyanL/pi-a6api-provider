@@ -17,7 +17,7 @@ import { dirname, join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { asArray, asNumber, asRecord, asString } from "./json.ts";
+import { asArray, asBoolean, asNumber, asRecord, asString } from "./json.ts";
 
 export const DEFAULT_BASE_URL = "https://api.a6api.vip/v1";
 
@@ -135,6 +135,8 @@ export interface EndpointState {
 	since: number;
 	/** Why the switch happened, e.g. `failover after 3 unreachable requests`. */
 	reason?: string;
+	/** The user picked this edge, so a startup probe must not undo it. */
+	manual?: boolean;
 }
 
 let cache: { state: EndpointState | undefined } | undefined;
@@ -149,7 +151,14 @@ function readStateFromDisk(): EndpointState | undefined {
 		const baseUrl = withV1(asString(root?.baseUrl));
 		const primary = withV1(asString(root?.primary));
 		if (!baseUrl || !primary) return undefined;
-		return { baseUrl, primary, since: asNumber(root?.since) ?? 0, reason: asString(root?.reason) };
+		const manual = asBoolean(root?.manual);
+		return {
+			baseUrl,
+			primary,
+			since: asNumber(root?.since) ?? 0,
+			reason: asString(root?.reason),
+			...(manual === true ? { manual: true } : {}),
+		};
 	} catch {
 		return undefined;
 	}

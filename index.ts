@@ -269,9 +269,10 @@ function activateEndpoint(
 	primary: string,
 	reason: string,
 	ctx: ExtensionContext,
+	options: { manual?: boolean } = {},
 ): void {
 	if (url === primary) clearEndpointState();
-	else writeEndpointState({ baseUrl: url, primary, since: Date.now(), reason });
+	else writeEndpointState({ baseUrl: url, primary, since: Date.now(), reason, manual: options.manual === true });
 	registeredPi?.registerProvider(buildProvider());
 	renderStatus(ctx);
 }
@@ -326,6 +327,8 @@ async function returnToPrimary(ctx: ExtensionContext): Promise<void> {
 		clearEndpointState();
 		return;
 	}
+	// A manual pin is the user's choice: probing the primary must not undo it.
+	if (state.manual) return;
 	if (!(await probeEndpoint(primary))) {
 		if (process.env.A6API_DEBUG) {
 			console.error(`[a6api] primary ${endpointHost(primary)} still down, staying on ${endpointHost(state.baseUrl)}`);
@@ -474,10 +477,13 @@ function endpointLines(): string[] {
 			.join(", ");
 		return `  ${marker} ${index + 1}  ${host}  ${detail}${tags ? `  [${tags}]` : ""}`;
 	});
-	const head =
+	const switched =
 		state && state.baseUrl !== primary
-			? `A6API endpoints · switched ${formatAge(Date.now() - state.since)} ago${state.reason ? `: ${state.reason}` : ""}`
-			: "A6API endpoints";
+			? state.manual
+				? ` · pinned ${formatAge(Date.now() - state.since)} ago`
+				: ` · switched ${formatAge(Date.now() - state.since)} ago${state.reason ? `: ${state.reason}` : ""}`
+			: "";
+	const head = `A6API endpoints${switched}`;
 	const edges =
 		getGatewayEndpoints().length > 0 ? "from api_info" : "defaults: the gateway has not published its edges yet";
 	return [
@@ -563,7 +569,7 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext, pi: Ext
 				return;
 			}
 			if (target.toLowerCase() === "reset") {
-				activateEndpoint(primary, primary, "manual reset", ctx);
+				activateEndpoint(primary, primary, "manual reset", ctx, { manual: true });
 				const fetched = await refreshCatalog(ctx, { attempts: 1 });
 				ctx.ui.notify(
 					fetched
@@ -583,7 +589,7 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext, pi: Ext
 				report(`A6API · no edge "${target}"`, endpointLines());
 				return;
 			}
-			activateEndpoint(picked.url, primary, "manual switch", ctx);
+			activateEndpoint(picked.url, primary, "manual switch", ctx, { manual: true });
 			const fetched = await refreshCatalog(ctx, { attempts: 1 });
 			ctx.ui.notify(
 				fetched
