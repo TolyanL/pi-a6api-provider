@@ -13,7 +13,7 @@
  * public `GET /api/pricing` (prices, groups, endpoints, vendors). Both are
  * fetched together, stored in one payload `{ models, pricing }`, and joined
  * here, so a model listed only by one side still appears with the other half
- * marked as unknown.
+ * marked as unknown. The public `GET /api/status` rides along for its edge list.
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import type { Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_BASE_URL, type A6ApiConfig, loadConfig, resolveBaseUrl } from "./config.ts";
+import { type GatewayEndpoint, parseGatewayEndpoints } from "./endpoints.ts";
 import { estimateLimits, looksReasoning, looksVision, vendorCatalogLimits, type ResolvedLimits } from "./estimate.ts";
 import { asArray, asNumber, asRecord, asString, stringList } from "./json.ts";
 import {
@@ -46,6 +47,8 @@ const SNAPSHOT_VERSION = 1;
 export interface CatalogPayload {
 	models: unknown;
 	pricing: unknown;
+	/** `GET /api/status`, kept for its `api_info` edge list. Optional. */
+	status?: unknown;
 }
 
 /** What the gateway's endpoints say a model is for. */
@@ -305,6 +308,9 @@ const catalogById = new Map<string, CatalogModel>();
 let snapshotFetchedAt: number | undefined;
 let pricingVersion: string | undefined;
 let groupRatio = 1;
+/** Bumped on every snapshot write, so a refresh can prove it actually landed. */
+let snapshotWrites = 0;
+let gatewayStatus: unknown;
 
 export function setCatalog(next: Catalog, fetchedAt?: number): void {
 	catalog = [...next.models];
@@ -331,6 +337,16 @@ export function getPricingVersion(): string | undefined {
 /** Default-group multiplier of the loaded catalog. */
 export function getGroupRatio(): number {
 	return groupRatio;
+}
+
+/** Edges the gateway last published in `api_info`; empty when it never did. */
+export function getGatewayEndpoints(): GatewayEndpoint[] {
+	return parseGatewayEndpoints(gatewayStatus);
+}
+
+/** Monotonic write counter of the snapshot; unchanged when a refresh did not land. */
+export function snapshotWriteCount(): number {
+	return snapshotWrites;
 }
 
 export function snapshotAgeMs(now = Date.now()): number | undefined {
@@ -376,6 +392,7 @@ export function writeSnapshotPayload(payload: CatalogPayload): void {
 			"utf8",
 		);
 		snapshotFetchedAt = fetchedAt;
+		snapshotWrites += 1;
 	} catch (error) {
 		console.warn(`[a6api] could not write catalog snapshot: ${error instanceof Error ? error.message : String(error)}`);
 	}
@@ -385,6 +402,7 @@ export function writeSnapshotPayload(payload: CatalogPayload): void {
 export function loadCatalogFromDisk(options: ParseOptions = {}): number {
 	const payload = readSnapshotPayload();
 	if (!payload) return 0;
+	gatewayStatus = asRecord(payload)?.status;
 	const parsed = parseCatalog(payload, options);
 	setCatalog(parsed, snapshotFetchedAt);
 	return parsed.models.length;
@@ -400,6 +418,15 @@ export function pricingUrl(baseUrl = resolveBaseUrl(loadConfig())): string {
 		return new URL("/api/pricing", baseUrl).toString();
 	} catch {
 		return new URL("/api/pricing", DEFAULT_BASE_URL).toString();
+	}
+}
+
+/** Public status endpoint of the same gateway; it carries the edge list. */
+export function statusUrl(baseUrl = resolveBaseUrl(loadConfig())): string {
+	try {
+		return new URL("/api/status", baseUrl).toString();
+	} catch {
+		return new URL("/api/status", DEFAULT_BASE_URL).toString();
 	}
 }
 
@@ -427,7 +454,7 @@ async function getJson(url: string, init: RequestInit): Promise<unknown> {
 export async function fetchCatalogPayload(apiKey: string, signal?: AbortSignal): Promise<CatalogPayload> {
 	const baseUrl = resolveBaseUrl(loadConfig());
 	const modelsUrl = `${baseUrl.replace(/\/$/, "")}/models`;
-	const [models, pricing] = await Promise.all([
+	const [models, pricing, status] = await Promise.all([
 		getJson(modelsUrl, {
 			headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
 			signal: combinedSignal(signal),
@@ -438,6 +465,12 @@ export async function fetchCatalogPayload(apiKey: string, signal?: AbortSignal):
 			headers: { Accept: "application/json" },
 			signal: combinedSignal(signal),
 		}),
+		// The edge list is auxiliary: losing it must not lose the catalog.
+		getJson(statusUrl(baseUrl), {
+			headers: { Accept: "application/json" },
+			signal: combinedSignal(signal),
+		}).catch(() => undefined),
 	]);
-	return { models, pricing };
+	gatewayStatus = status;
+	return { models, pricing, status };
 }

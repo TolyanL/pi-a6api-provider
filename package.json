@@ -24,6 +24,7 @@
   "files": [
     "index.ts",
     "catalog.ts",
+    "endpoints.ts",
     "config.ts",
     "estimate.ts",
     "info.ts",
@@ -39,7 +40,9 @@
     "test": "node tests/a6api.test.mjs"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

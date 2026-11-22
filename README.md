@@ -18,6 +18,7 @@ The extension does two things:
 - **Context estimates** — windows and output limits come from Pi's own vendor catalogs (or a sibling model), then the gateway's long-context floor, then a small family table.
 - **Offline-safe catalog** — the raw payload is snapshotted to `~/.pi/agent/a6api-catalog.json`; on a failed refresh the newer of that snapshot and Pi's persisted catalog is used.
 - **Per-model overrides** — `a6api.json` can fix a context window, an output limit, prices, capability flags, or hide a model entirely.
+- **Edge failover** — the gateway publishes its edges in `GET /api/status` (`api_info`); after three unreachable requests in a row the provider moves to the next edge, remembers it, and returns to the primary once it answers again.
 
 ## Requirements
 
@@ -82,6 +83,9 @@ The catalog snapshot is built by the first session (a background refresh at sess
 | `/a6api list [filter]` | Plain table (id, in/out price, context, flags), scrollable overlay |
 | `/a6api <model>` | Details for one model, e.g. `/a6api claude-sonnet-5` |
 | `/a6api refresh` | Reload `GET /v1/models` and `GET /api/pricing` |
+| `/a6api endpoint` | List the gateway edges, the active one, and the primary |
+| `/a6api endpoint <n\|url>` | Pin an edge by number or URL and refresh the catalog |
+| `/a6api endpoint reset` | Drop a remembered failover and go back to the primary |
 
 Picker keys: `↑↓` move, `⏎` use model, `esc` close, typing filters, `tab` cycles sort (name / cheapest / largest context), `ctrl+r` refreshes.
 
@@ -111,7 +115,9 @@ Optional `~/.pi/agent/a6api.json`, re-read on every refresh:
 
 | Key | Meaning |
 | --- | --- |
-| `baseUrl` | Endpoint override, e.g. a mirror gateway (`https://api.a6api.vip/v1`); the default |
+| `baseUrl` | Primary endpoint, e.g. a mirror gateway (`https://api.a6api.vip/v1`); the default |
+| `failover` | Rotate to the next edge when requests cannot reach the gateway. Default: `true` |
+| `failoverAfter` | Unreachable answers in a row before rotating. Default: `3` |
 | `hidden` | Ids that are never registered with Pi |
 | `models.<id>.name` | Display name |
 | `models.<id>.contextWindow` | Context window, overrides the estimate |
@@ -121,7 +127,29 @@ Optional `~/.pi/agent/a6api.json`, re-read on every refresh:
 | `models.<id>.compat` | Extra `openai-completions` compatibility flags |
 | `models.<id>.hidden` | Hide just this model |
 
-`A6API_CATALOG_TTL_MS` controls snapshot freshness (default one hour), `A6API_PRICING_URL` points at a different pricing endpoint, `A6API_DEBUG=1` logs refresh decisions to stderr, and `PI_A6API_CONFIG` relocates the config file (used by the tests).
+`A6API_CATALOG_TTL_MS` controls snapshot freshness (default one hour), `A6API_PRICING_URL` points at a different pricing endpoint, `A6API_DEBUG=1` logs refresh and failover decisions to stderr, and `PI_A6API_CONFIG` relocates the config file (used by the tests).
+
+## Gateway edges and failover
+
+A6API serves one gateway from several edges. They are not in the documentation — the documentation lists only `https://api.a6api.vip` — but the site's "API 地址 / 线路" block reads them from the public `GET /api/status`:
+
+```json
+{"data": {"api_info": [
+  {"route": "CDN全球节点", "url": "https://api.a6api.vip", "description": "路线自动选择"},
+  {"route": "CF 线路",     "url": "https://cf.a6api.net",  "description": "CF 优选线路"},
+  {"route": "图片/视频",   "url": "https://media.a6api.net", "description": "推荐图片/视频优先使用直链"}
+]}}
+```
+
+The catalog refresh fetches that list together with the models and pricing and stores it in the snapshot, so the edges are known even offline. Two endpoints (`cf.a6api.net`, `media.a6api.net`) are built in as a fallback for a fresh install whose primary is already dead. Every URL is normalized to a base ending in `/v1`.
+
+Failover keeps a counter of **unreachable** answers — transport failures, dropped streams, 5xx — as reported by Pi's own `isRetryableAssistantError` plus a filter that removes answers proving the edge is alive: `401`/`403`, `429`, quota, billing and context-overflow errors never rotate the endpoint. When the counter reaches `failoverAfter` (3 by default), the provider walks the edge list:
+
+1. The next edge is activated: the state file is written and the provider is re-registered, so the live session model points at the new host (the config-only `registerProvider(id, { baseUrl })` shortcut would drop a native provider, so the provider is rebuilt instead).
+2. A real catalog refresh from that host decides whether the switch worked. A host that resolves but serves nothing is skipped.
+3. If no edge answers, the provider returns to the one it started from and reports it.
+
+The choice is stored in `~/.pi/agent/a6api-endpoint.json` (`{ baseUrl, primary, since, reason }`), which is separate from `a6api.json` so a machine switch never rewrites your config. A remembered switch wins over `baseUrl` until either `/a6api endpoint reset` clears it, or `baseUrl` in the config changes, which retires the stale state. At startup the primary is probed once (a plain `GET /api/status`, 5 s timeout): if it answers, the provider returns to it; otherwise it keeps the working edge. While a switch is active the footer status carries the host, e.g. `A6 $1.00/$5.00 200k · cf.a6api.net`.
 
 ## Where the numbers come from
 
@@ -176,7 +204,8 @@ Requests are sent with `max_tokens` (not `max_completion_tokens`), which every u
 | `catalog.ts` | Join of both payloads, model definitions, snapshot |
 | `pricing.ts` | `GET /api/pricing` parsing and ratio → USD conversion |
 | `estimate.ts` | Family table for context/output limits, reasoning, vision |
-| `config.ts` | `~/.pi/agent/a6api.json` |
+| `config.ts` | `~/.pi/agent/a6api.json` and the effective endpoint |
+| `endpoints.ts` | `api_info` edges, failover state, unreachable classification |
 | `info.ts` | Summary, table, and detail text |
 | `picker.ts` | TUI model browser |
 | `text-view.ts` | Scrollable overlay for long command output |
@@ -187,7 +216,7 @@ Requests are sent with `max_tokens` (not `max_completion_tokens`), which every u
 npm test    # node tests/a6api.test.mjs
 ```
 
-The harness loads the extension through Pi's own `jiti`, uses the fixture payloads in `tests/fixtures` instead of the network, and sandboxes the agent dir in `/tmp`. It covers ratio math, tiers, per-call models, the `/v1/models` + `/api/pricing` join, config overrides, model definitions, snapshot round-trip, the provider refresh (against a stubbed `fetch`), the command handlers, and the picker/text view input handling.
+The harness loads the extension through Pi's own `jiti`, uses the fixture payloads in `tests/fixtures` instead of the network, and sandboxes the agent dir in `/tmp`. It covers ratio math, tiers, per-call models, the `/v1/models` + `/api/pricing` + `/api/status` join, config overrides, model definitions, snapshot round-trip, the provider refresh (against a stubbed `fetch`), edge parsing and rotation, the three-strike failover end to end (success resets it, `401`/`429` never rotate, a dead candidate is skipped, an exhausted rotation restores the previous edge), the command handlers, and the picker/text view input handling.
 
 ## License
 

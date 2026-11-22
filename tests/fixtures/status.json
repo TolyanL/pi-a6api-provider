@@ -1,0 +1,11 @@
+{
+  "data": {
+    "server_address": "https://a6api.vip",
+    "api_info_enabled": true,
+    "api_info": [
+      { "id": 3, "color": "blue", "route": "CDN全球节点", "description": "路线自动选择", "url": "https://api.a6api.vip" },
+      { "id": 4, "color": "blue", "route": "CF 线路", "description": "CF 优选线路", "url": "https://cf.a6api.net" },
+      { "id": 5, "color": "blue", "route": "图片/视频", "description": "推荐图片/视频优先使用直链", "url": "https://media.a6api.net" }
+    ]
+  }
+}

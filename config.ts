@@ -4,6 +4,7 @@
  * ```json
  * {
  *   "baseUrl": "https://api.a6api.vip/v1",
+ *   "failover": true,
  *   "hidden": ["some-model"],
  *   "models": {
  *     "gpt-5.2": {
@@ -18,13 +19,21 @@
  * The file is optional and re-read on every refresh, so edits apply without a
  * pi restart. A malformed file is reported once and ignored. Override the
  * location with `PI_A6API_CONFIG` (used by the tests).
+ *
+ * `baseUrl` is the primary edge. A failover to another edge is remembered in
+ * `a6api-endpoint.json` (see `endpoints.ts`) and wins over it until the
+ * primary answers again or the primary in this file changes.
  */
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_BASE_URL, readEndpointState, withV1 } from "./endpoints.ts";
 import { asBoolean, asNumber, asRecord, asString, positiveInt, stringList } from "./json.ts";
+
+/** Re-exported: the default edge moved to `endpoints.ts` with the rest of them. */
+export { DEFAULT_BASE_URL };
 
 export interface ModelOverride {
 	name?: string;
@@ -39,13 +48,16 @@ export interface ModelOverride {
 }
 
 export interface A6ApiConfig {
+	/** Primary edge; a remembered failover wins until it is retired. */
 	baseUrl?: string;
+	/** Rotate the edge when requests cannot reach the gateway. Default: on. */
+	failover?: boolean;
+	/** Unreachable answers in a row before rotating. Default: 3. */
+	failoverAfter?: number;
 	/** Ids that should never be registered, e.g. models the gateway lists but rejects. */
 	hidden: string[];
 	models: Record<string, ModelOverride>;
 }
-
-export const DEFAULT_BASE_URL = "https://api.a6api.vip/v1";
 
 let warnedAboutConfig = false;
 
@@ -116,6 +128,8 @@ export function loadConfig(): A6ApiConfig {
 
 		return {
 			baseUrl: asString(root.baseUrl),
+			failover: asBoolean(root.failover),
+			failoverAfter: positiveInt(root.failoverAfter),
 			hidden: stringList(root.hidden),
 			models,
 		};
@@ -130,8 +144,19 @@ export function loadConfig(): A6ApiConfig {
 	}
 }
 
-/** Effective API endpoint. */
+/** Endpoint the user asked for: `baseUrl` from the config, else the default edge. */
+export function primaryBaseUrl(config: A6ApiConfig): string {
+	return withV1(config.baseUrl) ?? DEFAULT_BASE_URL;
+}
+
+/**
+ * Effective API endpoint. A remembered failover wins over the primary, but only
+ * while the config still names the same primary: editing `baseUrl` retires the
+ * old switch instead of being silently ignored.
+ */
 export function resolveBaseUrl(config: A6ApiConfig): string {
-	const configured = config.baseUrl?.trim();
-	return configured && configured.length > 0 ? configured : DEFAULT_BASE_URL;
+	const primary = primaryBaseUrl(config);
+	const state = readEndpointState();
+	if (!state || state.primary !== primary || state.baseUrl === primary) return primary;
+	return state.baseUrl;
 }

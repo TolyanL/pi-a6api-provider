@@ -6,13 +6,18 @@
  * models appear in `/model`, `Ctrl+P` and `/models` like a built-in provider,
  * priced in the footer and in `/session`.
  *
+ * Failover: the gateway publishes its edges in `GET /api/status` (`api_info`).
+ * When three requests in a row cannot reach the model, the provider re-registers
+ * itself on the next edge and remembers the choice in `a6api-endpoint.json`; a
+ * later start goes back to the primary once it answers again.
+ *
  * Data flow follows pi-anymodel-provider: one `fetchCatalogPayload()` per refresh, one
  * raw snapshot on disk, `loadCatalogFromDisk()` before the provider registers,
  * and a TTL check so a session does not re-fetch a fresh catalog.
  *
  * Info: `/a6api` opens a searchable model browser (price, cache price,
  * long-context tiers, context/output limits, vendor, gateway groups), plus
- * `/a6api list`, `/a6api <model>`, and `/a6api refresh`.
+ * `/a6api list`, `/a6api <model>`, `/a6api endpoint`, and `/a6api refresh`.
  *
  * Usage: pi --extension ~/.pi/agent/extensions/pi-a6api-provider
  */
@@ -29,18 +34,33 @@ import {
 	fetchCatalogPayload,
 	getCatalog,
 	getCatalogModel,
+	getGatewayEndpoints,
 	getGroupRatio,
 	getPricingVersion,
 	loadCatalogFromDisk,
 	parseCatalog,
 	setCatalog,
 	snapshotAgeMs,
+	snapshotWriteCount,
 	snapshotPath,
 	toModel,
 	writeSnapshotPayload,
 	type CatalogModel,
 } from "./catalog.ts";
-import { loadConfig, resolveBaseUrl } from "./config.ts";
+import { loadConfig, primaryBaseUrl, resolveBaseUrl } from "./config.ts";
+import {
+	FAILOVER_AFTER,
+	clearEndpointState,
+	endpointCandidates,
+	endpointHost,
+	isUnreachableFailure,
+	probeEndpoint,
+	readEndpointState,
+	refreshEndpointState,
+	rotationFrom,
+	withV1,
+	writeEndpointState,
+} from "./endpoints.ts";
 import { describeLines, formatTokens, formatUsd, summaryLines, tableLines } from "./info.ts";
 import { A6ApiPickerComponent } from "./picker.ts";
 import { TextViewComponent } from "./text-view.ts";
@@ -53,7 +73,17 @@ const CATALOG_REFRESH_RETRY_MS = 600;
 /** A refresh can outlive its session (print mode exits fast); stale ctx must not throw. */
 let sessionActive = false;
 
+/** Set by the factory so failover can re-register the provider from event handlers. */
+let registeredPi: ExtensionAPI | undefined;
+
+/** Unreachable answers since the last successful one, in this process. */
+let unreachableStreak = 0;
+
+/** One rotation at a time: a retry storm must not walk the whole edge list. */
+let failoverInFlight = false;
+
 export default function a6apiExtension(pi: ExtensionAPI): void {
+	registeredPi = pi;
 	const debug = (message: string): void => {
 		if (process.env.A6API_DEBUG) console.error(`[a6api] ${message}`);
 	};
@@ -67,13 +97,36 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionActive = true;
-		// Another process may have refreshed the snapshot since load.
+		// Another process may have switched the edge or refreshed the snapshot.
+		refreshEndpointState();
 		loadCatalogFromDisk();
 		renderStatus(ctx);
 		if (!startupRefreshDone) {
 			startupRefreshDone = true;
-			void refreshCatalog(ctx);
+			void (async () => {
+				await returnToPrimary(ctx);
+				await refreshCatalog(ctx);
+			})();
 		}
+	});
+
+	// Every failed attempt passes through here, retries included: three
+	// unreachable answers in a row mean this edge is not usable.
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message;
+		if (message.role !== "assistant" || message.provider !== PROVIDER_ID) return;
+		if (message.stopReason !== "error") {
+			unreachableStreak = 0;
+			return;
+		}
+		const config = loadConfig();
+		if (config.failover === false || !isUnreachableFailure(message)) return;
+		unreachableStreak += 1;
+		const after = config.failoverAfter ?? FAILOVER_AFTER;
+		debug(`unreachable ${unreachableStreak}/${after}: ${message.errorMessage ?? ""}`);
+		if (unreachableStreak < after || failoverInFlight) return;
+		unreachableStreak = 0;
+		void failoverEndpoint(ctx, `failover after ${after} unreachable requests`);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
@@ -91,6 +144,7 @@ export default function a6apiExtension(pi: ExtensionAPI): void {
 			const commands = [
 				{ value: "list", label: "list [filter]", description: "Print the model table" },
 				{ value: "refresh", label: "refresh", description: "Reload /v1/models and /api/pricing" },
+				{ value: "endpoint", label: "endpoint [n|url|reset]", description: "Show or pin the gateway edge" },
 			];
 			const ids = getCatalog()
 				.filter((model) => !model.hidden)
@@ -192,24 +246,120 @@ function buildProvider() {
 	});
 }
 
+// ─── Endpoint failover ───────────────────────────────────────────────
+
+/** Stale ctx after a session switch or shutdown must not take pi down. */
+function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
+	try {
+		ctx.ui.notify(message, level);
+	} catch {
+		// The session is gone; the console line below is the only record left.
+	}
+	if (level !== "info") console.warn(`[a6api] ${message}`);
+}
+
+/**
+ * Move the provider to another edge. The config-only `registerProvider(id, {
+ * baseUrl })` shortcut is for config providers and drops a native registration,
+ * so the provider is rebuilt with the URL the state file now resolves to; pi
+ * then rewrites the live session model as well.
+ */
+function activateEndpoint(
+	url: string,
+	primary: string,
+	reason: string,
+	ctx: ExtensionContext,
+): void {
+	if (url === primary) clearEndpointState();
+	else writeEndpointState({ baseUrl: url, primary, since: Date.now(), reason });
+	registeredPi?.registerProvider(buildProvider());
+	renderStatus(ctx);
+}
+
+/**
+ * Rotate to the next edge that answers. Every switch is attempted by an actual
+ * catalog refresh, so a host that resolves but serves nothing cannot win.
+ */
+async function failoverEndpoint(ctx: ExtensionContext, reason: string): Promise<void> {
+	if (!registeredPi || failoverInFlight) return;
+	const config = loadConfig();
+	const primary = primaryBaseUrl(config);
+	const current = resolveBaseUrl(config);
+	const rotation = rotationFrom(endpointCandidates(primary, getGatewayEndpoints()), current);
+	if (rotation.length === 0) {
+		notify(ctx, "A6API: the gateway is unreachable and it publishes no other edge", "error");
+		return;
+	}
+	failoverInFlight = true;
+	try {
+		for (const candidate of rotation) {
+			if (process.env.A6API_DEBUG) console.error(`[a6api] failover: trying ${candidate.url}`);
+			activateEndpoint(candidate.url, primary, reason, ctx);
+			if (await refreshCatalog(ctx, { attempts: 1 })) {
+				const route = candidate.route ? ` (${candidate.route})` : "";
+				notify(
+					ctx,
+					`A6API: ${endpointHost(current)} is unreachable, switched to ${endpointHost(candidate.url)}${route}`,
+					"warning",
+				);
+				return;
+			}
+		}
+		// Nothing answered: stay where we were instead of drifting further.
+		activateEndpoint(current, primary, reason, ctx);
+		notify(ctx, `A6API: no edge answered, still on ${endpointHost(current)}`, "error");
+	} finally {
+		failoverInFlight = false;
+	}
+}
+
+/**
+ * A switch from a previous session is remembered. Go back to the primary once
+ * it answers again, otherwise keep using the edge that works.
+ */
+async function returnToPrimary(ctx: ExtensionContext): Promise<void> {
+	const config = loadConfig();
+	const primary = primaryBaseUrl(config);
+	const state = readEndpointState();
+	if (!state) return;
+	if (state.primary !== primary || state.baseUrl === primary) {
+		clearEndpointState();
+		return;
+	}
+	if (!(await probeEndpoint(primary))) {
+		if (process.env.A6API_DEBUG) {
+			console.error(`[a6api] primary ${endpointHost(primary)} still down, staying on ${endpointHost(state.baseUrl)}`);
+		}
+		return;
+	}
+	const route = endpointCandidates(primary, getGatewayEndpoints()).find((entry) => entry.url === primary)?.route;
+	activateEndpoint(primary, primary, "primary recovered", ctx);
+	notify(ctx, `A6API: ${endpointHost(primary)} is back${route ? ` (${route})` : ""}, using it again`, "info");
+}
+
 // ─── Catalog refresh ─────────────────────────────────────────────────
 
 /** Refresh through pi's registry so the provider list and the snapshot agree. */
-async function refreshCatalog(ctx: ExtensionContext): Promise<boolean> {
+async function refreshCatalog(
+	ctx: ExtensionContext,
+	options: { attempts?: number; timeoutMs?: number } = {},
+): Promise<boolean> {
+	const attempts = options.attempts ?? CATALOG_REFRESH_ATTEMPTS;
+	const timeoutMs = options.timeoutMs ?? CATALOG_REFRESH_TIMEOUT_MS;
 	const debugLog = (message: string): void => {
 		if (process.env.A6API_DEBUG) console.error(`[a6api] ${message}`);
 	};
 	let fetched = false;
 	try {
-		for (let attempt = 0; attempt < CATALOG_REFRESH_ATTEMPTS; attempt += 1) {
+		for (let attempt = 0; attempt < attempts; attempt += 1) {
 			if (!sessionActive) {
 				debugLog("refreshCatalog: session ended, stopping");
 				break;
 			}
 			if (attempt > 0) await delay(CATALOG_REFRESH_RETRY_MS * attempt);
-			const before = snapshotAgeMs();
+			const before = snapshotWriteCount();
 			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), CATALOG_REFRESH_TIMEOUT_MS);
+			const timeout = setTimeout(() => controller.abort(), timeoutMs);
 			try {
 				const result = await ctx.modelRegistry.refresh({
 					providers: [PROVIDER_ID],
@@ -228,9 +378,9 @@ async function refreshCatalog(ctx: ExtensionContext): Promise<boolean> {
 				clearTimeout(timeout);
 			}
 
-			// Success means a snapshot exists now and is newer than before the attempt.
-			const after = snapshotAgeMs();
-			fetched = after !== undefined && (before === undefined || after < before);
+			// Success means the refresh actually wrote a snapshot.
+			const after = snapshotWriteCount();
+			fetched = after !== before;
 			if (fetched) {
 				debugLog(`refreshCatalog: fetched catalog (attempt ${attempt + 1})`);
 				break;
@@ -269,15 +419,19 @@ function renderStatus(ctx: ExtensionContext, options: { clear?: boolean } = {}):
 		if (!model) return;
 		const entry = getCatalogModel(model.id);
 		const context = formatTokens(model.contextWindow);
+		// A failover is invisible otherwise, and it changes where requests go.
+		const config = loadConfig();
+		const active = resolveBaseUrl(config);
+		const edge = active === primaryBaseUrl(config) ? "" : ` · ${endpointHost(active)}`;
 		if (!entry || entry.kind !== "chat") {
-			ctx.ui.setStatus(STATUS_KEY, `A6 ${context}`);
+			ctx.ui.setStatus(STATUS_KEY, `A6 ${context}${edge}`);
 			return;
 		}
 		const price =
 			entry.cost.input === 0 && entry.cost.output === 0
 				? "price unknown"
 				: `${formatUsd(entry.cost.input)}/${formatUsd(entry.cost.output)}`;
-		ctx.ui.setStatus(STATUS_KEY, `A6 ${price} ${context}`);
+		ctx.ui.setStatus(STATUS_KEY, `A6 ${price} ${context}${edge}`);
 	} catch {
 		// Stale ctx: the session is gone, so there is nothing left to paint.
 	}
@@ -293,6 +447,46 @@ function summaryLinesForCatalog(): string[] {
 		groupRatio: getGroupRatio(),
 		fetchedAt: age === undefined ? undefined : Date.now() - age,
 	});
+}
+
+function formatAge(ms: number): string {
+	const minutes = Math.round(ms / 60_000);
+	if (minutes < 1) return "just now";
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+}
+
+/** Edge list for `/a6api endpoint`: numbered, with the active and primary marked. */
+function endpointLines(): string[] {
+	const config = loadConfig();
+	const primary = primaryBaseUrl(config);
+	const current = resolveBaseUrl(config);
+	const candidates = endpointCandidates(primary, getGatewayEndpoints());
+	const state = readEndpointState();
+	const width = Math.max(...candidates.map((candidate) => endpointHost(candidate.url).length));
+	const lines = candidates.map((candidate, index) => {
+		const marker = candidate.url === current ? "*" : " ";
+		const host = endpointHost(candidate.url).padEnd(width);
+		const detail = [candidate.route, candidate.note].filter(Boolean).join(" · ");
+		const tags = [candidate.url === primary ? "primary" : "", candidate.url === current ? "active" : ""]
+			.filter(Boolean)
+			.join(", ");
+		return `  ${marker} ${index + 1}  ${host}  ${detail}${tags ? `  [${tags}]` : ""}`;
+	});
+	const head =
+		state && state.baseUrl !== primary
+			? `A6API endpoints · switched ${formatAge(Date.now() - state.since)} ago${state.reason ? `: ${state.reason}` : ""}`
+			: "A6API endpoints";
+	const edges =
+		getGatewayEndpoints().length > 0 ? "from api_info" : "defaults: the gateway has not published its edges yet";
+	return [
+		`${head} (${edges})`,
+		"",
+		...lines,
+		"",
+		"/a6api endpoint <number|url> pins an edge, /a6api endpoint reset goes back to the primary.",
+	];
 }
 
 async function handleCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
@@ -346,14 +540,57 @@ async function handleCommand(args: string, ctx: ExtensionCommandContext, pi: Ext
 		case "refresh": {
 			const fetched = await refreshCatalog(ctx);
 			const chat = chatModels(getCatalog()).length;
+			const edge = endpointHost(resolveBaseUrl(loadConfig()));
 			if (fetched) {
-				ctx.ui.notify(`A6API catalog refreshed: ${chat} chat models of ${getCatalog().length}.`, "info");
+				ctx.ui.notify(`A6API catalog refreshed via ${edge}: ${chat} chat models of ${getCatalog().length}.`, "info");
 			} else {
 				ctx.ui.notify(
-					`Catalog not refreshed (no A6API key, offline, or superseded). Cached: ${chat} chat models.`,
+					`Catalog not refreshed via ${edge} (no A6API key, offline, or superseded). Cached: ${chat} chat models.`,
 					"warning",
 				);
 			}
+			return;
+		}
+
+		case "endpoint": {
+			const config = loadConfig();
+			const primary = primaryBaseUrl(config);
+			const target = rest.join(" ").trim();
+			const candidates = endpointCandidates(primary, getGatewayEndpoints());
+
+			if (target.length === 0) {
+				report("A6API endpoints", endpointLines());
+				return;
+			}
+			if (target.toLowerCase() === "reset") {
+				activateEndpoint(primary, primary, "manual reset", ctx);
+				const fetched = await refreshCatalog(ctx, { attempts: 1 });
+				ctx.ui.notify(
+					fetched
+						? `A6API: back on the primary edge ${endpointHost(primary)}.`
+						: `A6API: reset to ${endpointHost(primary)}, but the catalog did not refresh.`,
+					fetched ? "info" : "warning",
+				);
+				return;
+			}
+
+			const index = Number.parseInt(target, 10);
+			const picked =
+				Number.isInteger(index) && index >= 1 && index <= candidates.length
+					? candidates[index - 1]
+					: candidates.find((candidate) => candidate.url === withV1(target));
+			if (!picked) {
+				report(`A6API · no edge "${target}"`, endpointLines());
+				return;
+			}
+			activateEndpoint(picked.url, primary, "manual switch", ctx);
+			const fetched = await refreshCatalog(ctx, { attempts: 1 });
+			ctx.ui.notify(
+				fetched
+					? `A6API: using ${endpointHost(picked.url)}.`
+					: `A6API: ${endpointHost(picked.url)} did not answer, the model list is unchanged.`,
+				fetched ? "info" : "warning",
+			);
 			return;
 		}
 

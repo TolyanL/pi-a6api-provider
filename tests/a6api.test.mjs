@@ -4,28 +4,61 @@
  *
  * Run: node tests/a6api.test.mjs
  *
- * Requires the pi install path (override with PI_PACKAGE). Hermetic: both
- * gateway payloads come from tests/fixtures, and the agent dir is a temp dir.
+ * Needs a pi install with its dependencies resolvable; PI_PACKAGE overrides the
+ * lookup. Bun and npm layouts both work, so the harness resolves through the
+ * package's own require instead of assuming a nested node_modules. Hermetic:
+ * both gateway payloads come from tests/fixtures, and the agent dir is a temp dir.
  */
 
-const PI = process.env.PI_PACKAGE ?? "/home/tolyan/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent";
+const { existsSync } = await import("node:fs");
+const { join } = await import("node:path");
+
+const PI_CANDIDATES = [
+	process.env.PI_PACKAGE,
+	"/home/tolyan/.bun/install/global/node_modules/@earendil-works/pi-coding-agent",
+	"/home/tolyan/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent",
+].filter(Boolean);
+
+/** pi-ai/pi-tui sit either beside pi (bun) or in its own node_modules (npm). */
+function dependencyRoot(piDir, name) {
+	return [join(piDir, "node_modules", name), join(piDir, "..", "..", name)].find((dir) =>
+		existsSync(join(dir, "dist/index.js")),
+	);
+}
+
+/** An install is usable when its own dist and its pi-ai dependency both exist. */
+function usablePi(dir) {
+	return existsSync(join(dir, "dist/index.js")) && dependencyRoot(dir, "@earendil-works/pi-ai") !== undefined;
+}
+
+const PI = PI_CANDIDATES.find(usablePi) ?? PI_CANDIDATES[0];
+const PI_AI_ROOT = dependencyRoot(PI, "@earendil-works/pi-ai");
+const PI_TUI_ROOT = dependencyRoot(PI, "@earendil-works/pi-tui");
+
 const here = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const fixtures = `${here}/tests/fixtures`;
 
-const { createJiti } = await import(`${PI}/node_modules/jiti/lib/jiti.mjs`);
+const JITI = [
+	join(PI, "node_modules/jiti/lib/jiti.mjs"),
+	join(PI, "..", "..", "jiti/lib/jiti.mjs"),
+].find((entry) => existsSync(entry));
+const { createJiti } = await import(JITI);
 
+// Trailing-slash keys win over the bare ones in jiti's longest-prefix match, so
+// pi's own `@earendil-works/pi-ai/utils/retry` style imports keep resolving.
 const jiti = createJiti(import.meta.url, {
 	alias: {
-		"@earendil-works/pi-coding-agent": `${PI}/dist/index.js`,
-		"@earendil-works/pi-ai/compat": `${PI}/node_modules/@earendil-works/pi-ai/dist/compat.js`,
-		"@earendil-works/pi-ai/providers/all": `${PI}/node_modules/@earendil-works/pi-ai/dist/providers/all.js`,
-		"@earendil-works/pi-ai": `${PI}/node_modules/@earendil-works/pi-ai/dist/index.js`,
-		"@earendil-works/pi-tui": `${PI}/node_modules/@earendil-works/pi-tui/dist/index.js`,
+		"@earendil-works/pi-coding-agent": join(PI, "dist/index.js"),
+		"@earendil-works/pi-ai/": `${PI_AI_ROOT}/dist/`,
+		"@earendil-works/pi-ai": `${PI_AI_ROOT}/dist/index.js`,
+		"@earendil-works/pi-tui/": `${PI_TUI_ROOT}/dist/`,
+		"@earendil-works/pi-tui": `${PI_TUI_ROOT}/dist/index.js`,
 	},
 });
 
-const { mkdirSync, readFileSync, rmSync } = await import("node:fs");
-const { join } = await import("node:path");
+const { mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+
+// Keep the trailing-slash rule intact when the paths above were already files.
 
 delete process.env.A6API_API_KEY;
 delete process.env.A6API_KEY;
@@ -41,16 +74,18 @@ process.env.PI_A6API_CONFIG = `${fixtures}/a6api-config.json`;
 const payloads = {
 	models: JSON.parse(readFileSync(`${fixtures}/models.json`, "utf8")),
 	pricing: JSON.parse(readFileSync(`${fixtures}/pricing.json`, "utf8")),
+	status: JSON.parse(readFileSync(`${fixtures}/status.json`, "utf8")),
 };
 
 const catalog = await jiti.import(`${here}/catalog.ts`);
+const endpoints = await jiti.import(`${here}/endpoints.ts`);
 const pricing = await jiti.import(`${here}/pricing.ts`);
 const config = await jiti.import(`${here}/config.ts`);
 const estimate = await jiti.import(`${here}/estimate.ts`);
 const info = await jiti.import(`${here}/info.ts`);
 const picker = await jiti.import(`${here}/picker.ts`);
 const textView = await jiti.import(`${here}/text-view.ts`);
-const piTui = await jiti.import(`${PI}/node_modules/@earendil-works/pi-tui/dist/index.js`);
+const piTui = await jiti.import(`${PI_TUI_ROOT}/dist/index.js`);
 const extension = await jiti.import(`${here}/index.ts`, { default: true });
 
 let failures = 0;
@@ -403,6 +438,124 @@ check("pricePair embedding", info.pricePair(byId.get("text-embedding-3-large")),
 	check("snapshot restored after the fresh-install check", catalog.chatModels(catalog.getCatalog()).length, 4);
 }
 
+// ─── gateway edges ───────────────────────────────────────────────────
+{
+	check("root base url gets /v1", endpoints.withV1("https://api.a6api.vip"), "https://api.a6api.vip/v1");
+	check("a trailing slash is dropped", endpoints.withV1("https://api.a6api.vip/v1/"), "https://api.a6api.vip/v1");
+	check("query and hash are dropped", endpoints.withV1("https://h.example/v1?a=1#b"), "https://h.example/v1");
+	check("a plain path keeps /v1", endpoints.withV1("https://proxy.example.com/openai"), "https://proxy.example.com/openai/v1");
+	check("non-http schemes are refused", endpoints.withV1("ftp://h.example"), undefined);
+	check("garbage is refused", endpoints.withV1("not a url"), undefined);
+	check("empty is refused", endpoints.withV1("  "), undefined);
+
+	const discovered = endpoints.parseGatewayEndpoints(payloads.status);
+	check("api_info is parsed", discovered.map((entry) => entry.url), [
+		"https://api.a6api.vip/v1",
+		"https://cf.a6api.net/v1",
+		"https://media.a6api.net/v1",
+	]);
+	check("edge routes are kept", discovered[1].route, "CF 线路");
+	check(
+		"a bare body works too",
+		endpoints.parseGatewayEndpoints({ api_info: [{ url: "https://api.a6api.vip" }] }).map((entry) => entry.url),
+		["https://api.a6api.vip/v1"],
+	);
+	check("garbage status yields nothing", endpoints.parseGatewayEndpoints({ data: { api_info: 5 } }), []);
+	check("null status yields nothing", endpoints.parseGatewayEndpoints(null), []);
+
+	const candidates = endpoints.endpointCandidates("https://api.a6api.vip/v1", discovered);
+	check("primary first, no duplicates", candidates.map((entry) => entry.url), [
+		"https://api.a6api.vip/v1",
+		"https://cf.a6api.net/v1",
+		"https://media.a6api.net/v1",
+	]);
+	check(
+		"known edges stand in when api_info is empty",
+		endpoints.endpointCandidates("https://api.a6api.vip/v1", []).map((entry) => entry.url),
+		["https://api.a6api.vip/v1", "https://cf.a6api.net/v1", "https://media.a6api.net/v1"],
+	);
+	check("rotation starts after the active edge", endpoints.rotationFrom(candidates, "https://cf.a6api.net/v1").map((entry) => entry.url), [
+		"https://media.a6api.net/v1",
+		"https://api.a6api.vip/v1",
+	]);
+	check("rotation skips an unknown active edge", endpoints.rotationFrom(candidates, "https://elsewhere.example/v1").length, 3);
+	check("host helper", endpoints.endpointHost("https://cf.a6api.net/v1"), "cf.a6api.net");
+
+	// Unreachable means transport or a dead edge, never the account.
+	const unreachable = (errorMessage, stopReason = "error") => endpoints.isUnreachableFailure({ stopReason, errorMessage });
+	check("fetch failure is unreachable", unreachable("fetch failed"), true);
+	check("socket reset is unreachable", unreachable("read ECONNRESET"), true);
+	check("502 is unreachable", unreachable("502 Bad Gateway"), true);
+	check("503 is unreachable", unreachable("503 Service Temporarily Unavailable"), true);
+	check("a dropped stream is unreachable", unreachable("Stream ended without finish_reason"), true);
+	check("rate limit is reachable", unreachable("429 rate limit exceeded"), false);
+	check("overload is reachable", unreachable("provider is overloaded"), false);
+	check("a bad key is reachable", unreachable("401 invalid api key"), false);
+	check("quota is reachable", unreachable("insufficient_quota"), false);
+	check("context overflow is not an edge problem", unreachable("prompt is too long: 300000 tokens > 200000 maximum"), false);
+	check("a success is not a failure", unreachable(undefined, "stop"), false);
+	check("an abort is not a failure", unreachable("aborted", "aborted"), false);
+
+	// Remembered switch: state file, cache and the primary it belongs to.
+	endpoints.clearEndpointState();
+	check("no state initially", endpoints.readEndpointState(), undefined);
+	check("state path sits in the agent dir", endpoints.endpointStatePath(), join(TEST_AGENT, "a6api-endpoint.json"));
+	endpoints.writeEndpointState({
+		baseUrl: "https://cf.a6api.net/v1",
+		primary: "https://api.a6api.vip/v1",
+		since: 1234,
+		reason: "failover after 3 unreachable requests",
+	});
+	endpoints.refreshEndpointState();
+	check("state round-trips", endpoints.readEndpointState(), {
+		baseUrl: "https://cf.a6api.net/v1",
+		primary: "https://api.a6api.vip/v1",
+		since: 1234,
+		reason: "failover after 3 unreachable requests",
+	});
+	check("a remembered switch wins over the primary", config.resolveBaseUrl(userConfig), "https://cf.a6api.net/v1");
+	check(
+		"editing baseUrl retires the switch",
+		config.resolveBaseUrl({ ...userConfig, baseUrl: "https://other.example" }),
+		"https://other.example/v1",
+	);
+	endpoints.clearEndpointState();
+	check("reset forgets the switch", config.resolveBaseUrl(userConfig), "https://api.a6api.vip/v1");
+
+	// Failover switches are declared in a6api.json.
+	const previousConfigPath = process.env.PI_A6API_CONFIG;
+	process.env.PI_A6API_CONFIG = join(TEST_AGENT, "failover-config.json");
+	writeFileSync(
+		process.env.PI_A6API_CONFIG,
+		JSON.stringify({ baseUrl: "https://api.a6api.vip", failover: false, failoverAfter: 5 }),
+	);
+	const tuned = config.loadConfig();
+	check("failover can be turned off", tuned.failover, false);
+	check("failoverAfter is parsed", tuned.failoverAfter, 5);
+	check("the primary is normalized", config.primaryBaseUrl(tuned), "https://api.a6api.vip/v1");
+	process.env.PI_A6API_CONFIG = previousConfigPath;
+
+	// Probe = the public status endpoint answering.
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		check("probe hits /api/status", String(url), "https://api.a6api.vip/api/status");
+		return new Response("{}", { status: 200 });
+	};
+	try {
+		check("a live edge probes true", await endpoints.probeEndpoint("https://api.a6api.vip/v1", 1000), true);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+	globalThis.fetch = async () => {
+		throw new Error("fetch failed");
+	};
+	try {
+		check("a dead edge probes false", await endpoints.probeEndpoint("https://api.a6api.vip/v1", 1000), false);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
 // ─── extension ───────────────────────────────────────────────────────
 const plainTheme = { fg: (_color, text) => text, bold: (text) => text };
 const stripAnsi = (line) => line.replace(/\x1B\[[0-9;]*m/g, "");
@@ -426,13 +579,23 @@ async function buildExt() {
 	const commands = new Map();
 	const providers = [];
 	const pi = {
-		registerProvider: (provider) => providers.push(provider),
+		registerProvider: (provider, config) => providers.push(config ? { ...config } : provider),
 		registerCommand: (name, options) => commands.set(name, options),
 		setModel: async () => true,
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 	};
 	await extension(pi);
 	return { handlers, commands, providers };
+}
+
+/** The failover runs detached from `message_end`; give it a moment to settle. */
+async function waitFor(predicate, timeoutMs = 2000) {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		if (predicate()) return true;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	return predicate();
 }
 
 function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 400000, maxTokens: 128000 }, mode = "print" } = {}) {
@@ -501,12 +664,17 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 	await provider.refreshModels(refreshContext());
 	check("offline refresh keeps the cached models", provider.getModels().length, 4);
 
-	// Gateway refresh: both payloads come back from a stubbed fetch.
+	// Gateway refresh: all three payloads come back from a stubbed fetch.
 	const originalFetch = globalThis.fetch;
 	const requested = [];
 	globalThis.fetch = async (url) => {
-		requested.push(String(url));
-		const body = String(url).endsWith("/models") ? payloads.models : payloads.pricing;
+		const target = String(url);
+		requested.push(target);
+		const body = target.endsWith("/models")
+			? payloads.models
+			: target.endsWith("/api/pricing")
+				? payloads.pricing
+				: payloads.status;
 		return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 	};
 	try {
@@ -514,8 +682,9 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
-	check("both gateway endpoints are requested", requested.sort(), [
+	check("model, pricing and status endpoints are requested", requested.sort(), [
 		"https://api.a6api.vip/api/pricing",
+		"https://api.a6api.vip/api/status",
 		"https://api.a6api.vip/v1/models",
 	]);
 	check("network refresh publishes chat models", provider.getModels().map((model) => model.id), [
@@ -701,6 +870,141 @@ function makeCtx({ model = { id: "gpt-5.2", provider: "a6api", contextWindow: 40
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	await handlers.get("session_shutdown")[0]({ type: "session_shutdown" }, ctx);
 	ok("a refresh outliving its session does not reject", true);
+}
+
+// ─── endpoint failover ───────────────────────────────────────────────
+{
+	endpoints.clearEndpointState();
+	endpoints.refreshEndpointState();
+	catalog.loadCatalogFromDisk({ config: userConfig, resolveLimits: stubLimits });
+	// An older snapshot, so a refresh in this test is unambiguous.
+	catalog.setCatalog(joined, Date.now() - 60_000);
+
+	const { handlers, commands, providers } = await buildExt();
+	/** pi re-registers the provider on a switch, so the latest one is the live one. */
+	const liveProvider = () => providers.at(-1);
+	const ctx = makeCtx();
+	ctx.modelRegistry.refresh = async () => {
+		await liveProvider().refreshModels({
+			credential: { type: "api_key", key: "test-key" },
+			stored: undefined,
+			allowNetwork: true,
+			force: true,
+			signal: new AbortController().signal,
+			publish: async (publication) => {
+				publication.update?.();
+				return true;
+			},
+		});
+		return { errors: new Map(), aborted: false };
+	};
+
+	const messageEnd = (message) => handlers.get("message_end")[0]({ message }, ctx);
+	const fail = (errorMessage = "fetch failed") =>
+		messageEnd({ role: "assistant", provider: "a6api", stopReason: "error", errorMessage });
+	const succeed = () => messageEnd({ role: "assistant", provider: "a6api", stopReason: "stop" });
+	const noticeText = () => ctx.notices.map((notice) => notice[1]).join("\n");
+
+	const originalFetch = globalThis.fetch;
+	const requested = [];
+	const serveGateway = async (url) => {
+		const target = String(url);
+		requested.push(target);
+		const body = target.endsWith("/models")
+			? payloads.models
+			: target.endsWith("/api/pricing")
+				? payloads.pricing
+				: payloads.status;
+		return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+	};
+
+	try {
+		globalThis.fetch = serveGateway;
+		// Failover only runs inside a live session, like the real thing.
+		await handlers.get("session_start")[0]({ type: "session_start" }, ctx);
+		await waitFor(() => providers.length >= 1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// Two failures are not enough; the third rotates the edge.
+		await fail();
+		await fail();
+		check("no switch before the third failure", providers.length, 1);
+		check("still on the primary after two failures", config.resolveBaseUrl(userConfig), "https://api.a6api.vip/v1");
+
+		await fail();
+		ok("third failure switches the edge", await waitFor(() => providers.length > 1));
+		check("the next edge in api_info is used", providers.at(-1).baseUrl, "https://cf.a6api.net/v1");
+		check("the switch is remembered", endpoints.readEndpointState()?.baseUrl, "https://cf.a6api.net/v1");
+		check("the state names the primary it left", endpoints.readEndpointState()?.primary, "https://api.a6api.vip/v1");
+		ok("the switch is announced", await waitFor(() => noticeText().includes("switched to cf.a6api.net")));
+		check("the catalog is refetched from the new edge", requested.some((url) => url.startsWith("https://cf.a6api.net/v1/models")), true);
+		check("the live provider follows the new edge", liveProvider().baseUrl, "https://cf.a6api.net/v1");
+		check("models were republished on the new edge", [...new Set(liveProvider().getModels().map((model) => model.baseUrl))], [
+			"https://cf.a6api.net/v1",
+		]);
+
+		// One good answer resets the streak.
+		await succeed();
+		await fail();
+		await fail();
+		check("a success resets the streak", providers.length, 2);
+
+		// Account and throttle errors prove the edge is alive.
+		for (let attempt = 0; attempt < 4; attempt += 1) await fail("401 invalid api key");
+		for (let attempt = 0; attempt < 4; attempt += 1) await fail("429 rate limit exceeded");
+		check("account and throttle errors do not rotate", providers.length, 2);
+
+		// A candidate that resolves but serves nothing is skipped.
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
+		await succeed();
+		globalThis.fetch = async (url) => {
+			if (String(url).startsWith("https://cf.a6api.net")) throw new Error("fetch failed");
+			return serveGateway(url);
+		};
+		await fail();
+		await fail();
+		await fail();
+		ok("a dead candidate is skipped", await waitFor(() => providers.at(-1)?.baseUrl === "https://media.a6api.net/v1"));
+		ok("the skipped edge is announced as media", await waitFor(() => noticeText().includes("switched to media.a6api.net")));
+
+		// No edge left: report it and stay where we were.
+		endpoints.clearEndpointState();
+		endpoints.refreshEndpointState();
+		await succeed();
+		globalThis.fetch = async () => {
+			throw new Error("fetch failed");
+		};
+		await fail();
+		await fail();
+		await fail();
+		ok("the rotation ends on the edge it started from", await waitFor(() => providers.at(-1)?.baseUrl === "https://api.a6api.vip/v1"));
+		contains("an exhausted rotation is reported", noticeText(), "no edge answered");
+		check("an exhausted rotation leaves no state", endpoints.readEndpointState(), undefined);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+
+	// The command surface: list the edges, pin one, reset to the primary.
+	globalThis.fetch = serveGateway;
+	try {
+		await commands.get("a6api").handler("endpoint", ctx);
+		const listed = noticeText();
+		contains("endpoint lists the primary", listed, "api.a6api.vip");
+		contains("endpoint lists the CF edge", listed, "cf.a6api.net");
+		contains("endpoint marks the primary", listed, "[primary, active]");
+
+		await commands.get("a6api").handler("endpoint 2", ctx);
+		check("endpoint pins by number", endpoints.readEndpointState()?.baseUrl, "https://cf.a6api.net/v1");
+		check("pinning re-registers the provider", providers.at(-1).baseUrl, "https://cf.a6api.net/v1");
+
+		await commands.get("a6api").handler("endpoint reset", ctx);
+		check("reset forgets the switch", endpoints.readEndpointState(), undefined);
+		check("reset re-registers the primary", providers.at(-1).baseUrl, "https://api.a6api.vip/v1");
+		check("reset returns the effective url", config.resolveBaseUrl(config.loadConfig()), "https://api.a6api.vip/v1");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 }
 
 // ─── picker ──────────────────────────────────────────────────────────
